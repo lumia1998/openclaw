@@ -5,6 +5,7 @@ import { formatConfigIssueLines, normalizeConfigIssues } from "../config/issue-f
 import { CONFIG_PATH } from "../config/paths.js";
 import { isBlockedObjectKey } from "../config/prototype-keys.js";
 import { redactConfigObject } from "../config/redact-snapshot.js";
+import { resolveGatewayService } from "../daemon/service.js";
 import { danger, info, success } from "../globals.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { defaultRuntime } from "../runtime.js";
@@ -12,6 +13,7 @@ import { formatDocsLink } from "../terminal/links.js";
 import { theme } from "../terminal/theme.js";
 import { shortenHomePath } from "../utils.js";
 import { formatCliCommand } from "./command-format.js";
+import fs from "node:fs";
 
 type PathSegment = string;
 type ConfigSetParseOpts = {
@@ -392,6 +394,42 @@ export async function runConfigValidate(opts: { json?: boolean; runtime?: Runtim
   }
 }
 
+export async function runConfigRestore(opts: { runtime?: RuntimeEnv } = {}) {
+  const runtime = opts.runtime ?? defaultRuntime;
+  try {
+    const snapshot = await readConfigFileSnapshot();
+    const configPath = snapshot.path;
+    const backupPath = `${configPath}.bak`;
+
+    if (!fs.existsSync(backupPath)) {
+      runtime.error(danger(`No recent backup found at ${shortenHomePath(backupPath)}.`));
+      runtime.exit(1);
+      return;
+    }
+
+    // Replace the config with its backup
+    fs.copyFileSync(backupPath, configPath);
+    runtime.log(success(`Successfully restored config from ${shortenHomePath(backupPath)}.`));
+
+    // Try to restart the gateway
+    try {
+      const service = resolveGatewayService();
+      if (await service.isLoaded({ system: false })) {
+        runtime.log(info("Restarting gateway..."));
+        await service.restart({ system: false });
+        runtime.log(success("Gateway restarted."));
+      } else {
+        runtime.log(info("Gateway is not running as a background service. Start it manually to apply changes."));
+      }
+    } catch (err) {
+      runtime.error(danger(`Failed to conditionally restart gateway: ${String(err)}`));
+    }
+  } catch (err) {
+    runtime.error(danger(`Config restore failed: ${String(err)}`));
+    runtime.exit(1);
+  }
+}
+
 export function registerConfigCli(program: Command) {
   const cmd = program
     .command("config")
@@ -472,5 +510,12 @@ export function registerConfigCli(program: Command) {
     .option("--json", "Output validation result as JSON", false)
     .action(async (opts) => {
       await runConfigValidate({ json: Boolean(opts.json) });
+    });
+
+  cmd
+    .command("restore")
+    .description("Restore the configuration from the most recent backup (.bak) and restart the gateway")
+    .action(async () => {
+      await runConfigRestore({});
     });
 }

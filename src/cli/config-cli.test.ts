@@ -11,7 +11,7 @@ import type { ConfigFileSnapshot, OpenClawConfig } from "../config/types.js";
 const mockReadConfigFileSnapshot = vi.fn<() => Promise<ConfigFileSnapshot>>();
 const mockWriteConfigFile = vi.fn<
   (cfg: OpenClawConfig, options?: { unsetPaths?: string[][] }) => Promise<void>
->(async () => {});
+>(async () => { });
 
 vi.mock("../config/config.js", () => ({
   readConfigFileSnapshot: () => mockReadConfigFileSnapshot(),
@@ -25,6 +25,20 @@ const mockExit = vi.fn((code: number) => {
   const errorMessages = mockError.mock.calls.map((c) => c.join(" ")).join("; ");
   throw new Error(`__exit__:${code} - ${errorMessages}`);
 });
+
+import fs from "node:fs";
+
+let mockFsExistsSync: ReturnType<typeof vi.spyOn>;
+let mockFsCopyFileSync: ReturnType<typeof vi.spyOn>;
+
+const mockGatewayIsLoaded = vi.fn();
+const mockGatewayRestart = vi.fn();
+vi.mock("../daemon/service.js", () => ({
+  resolveGatewayService: () => ({
+    isLoaded: mockGatewayIsLoaded,
+    restart: mockGatewayRestart,
+  }),
+}));
 
 vi.mock("../runtime.js", () => ({
   defaultRuntime: {
@@ -119,10 +133,58 @@ describe("config cli", () => {
     sharedProgram = new Command();
     sharedProgram.exitOverride();
     registerConfigCli(sharedProgram);
+
+    // Use spyOn for fs methods to avoid breaking commander internals who need real fs functions
+    mockFsExistsSync = vi.spyOn(fs, "existsSync");
+    mockFsCopyFileSync = vi.spyOn(fs, "copyFileSync").mockImplementation(() => { });
   });
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockFsExistsSync.mockReturnValue(false);
+    mockGatewayIsLoaded.mockResolvedValue(false);
+  });
+
+  describe("config restore", () => {
+    it("errors and exits if no backup is found", async () => {
+      const resolved: OpenClawConfig = { gateway: { port: 18789 } };
+      setSnapshot(resolved, resolved);
+      mockFsExistsSync.mockReturnValue(false);
+
+      await expect(runConfigCommand(["config", "restore"])).rejects.toThrow("__exit__:1");
+      expect(mockError).toHaveBeenCalledWith(expect.stringContaining("No recent backup found at"));
+      expect(mockFsCopyFileSync).not.toHaveBeenCalled();
+    });
+
+    it("restores config and restarts gateway if it is running as a service", async () => {
+      const resolved: OpenClawConfig = { gateway: { port: 18789 } };
+      setSnapshot(resolved, resolved);
+      mockFsExistsSync.mockReturnValue(true);
+      mockGatewayIsLoaded.mockResolvedValue(true);
+
+      await runConfigCommand(["config", "restore"]);
+
+      expect(mockFsCopyFileSync).toHaveBeenCalledWith("/tmp/openclaw.json.bak", "/tmp/openclaw.json");
+      expect(mockLog).toHaveBeenCalledWith(expect.stringContaining("Successfully restored config"));
+      expect(mockLog).toHaveBeenCalledWith(expect.stringContaining("Restarting gateway..."));
+      expect(mockGatewayRestart).toHaveBeenCalledWith({ system: false });
+      expect(mockExit).not.toHaveBeenCalled();
+    });
+
+    it("restores config but does not restart gateway if it is not running as a service", async () => {
+      const resolved: OpenClawConfig = { gateway: { port: 18789 } };
+      setSnapshot(resolved, resolved);
+      mockFsExistsSync.mockReturnValue(true);
+      mockGatewayIsLoaded.mockResolvedValue(false);
+
+      await runConfigCommand(["config", "restore"]);
+
+      expect(mockFsCopyFileSync).toHaveBeenCalledWith("/tmp/openclaw.json.bak", "/tmp/openclaw.json");
+      expect(mockLog).toHaveBeenCalledWith(expect.stringContaining("Successfully restored config"));
+      expect(mockLog).toHaveBeenCalledWith(expect.stringContaining("Gateway is not running as a background service"));
+      expect(mockGatewayRestart).not.toHaveBeenCalled();
+      expect(mockExit).not.toHaveBeenCalled();
+    });
   });
 
   describe("config set - issue #6070", () => {
